@@ -1,300 +1,384 @@
-#!/usr/bin/env python3
+import asyncio
 import re
-import sys
+import random
 import time
 import json
-import argparse
-import socket
-import asyncio
-import concurrent.futures
-from datetime import datetime, timezone, timedelta
+import os
+from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
+import aiohttp
+import logging
 
-import requests
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+# ========== CONFIGURATION ==========
 
-# Constants
 DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1404164923780628561/UwfDFCiS54yUzOP1rhiLvtp04Yh9-ImRQW-7MgNEvsbTnUk4YLRmokWYJm4c4dJOXGyO"
-
+START_URL = "https://www.government.se/contact-information/"
+MAX_DEPTH = 3  # crawl depth (0 = only start page)
+MAX_PAGES = 200  # max total pages to crawl
+CONCURRENT_PAGES = 3  # concurrency of browser pages
+REQUEST_DELAY = (1.5, 3.5)  # random delay range between requests (seconds)
+PROXIES = []  # list of proxies (http://user:pass@ip:port), leave empty for none
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Mobile Safari/537.36",
+    # Realistic user agent strings to rotate
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0"
 ]
+EMAIL_REGEX = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+')
+SAVE_CHECKPOINT_EVERY = 30  # pages
+CHECKPOINT_FILE = "scraper_checkpoint.json"
+OUTPUT_EMAILS_FILE = "emails_found.json"
+LOG_FILE = "scraper.log"
+OBFUSCATE_KEYS = ['_a1b2', '_z9x8', '_r7s6']  # keys for very simple obfuscation
 
-COMMON_PORTS = [80, 443, 8080, 8000, 8443]
+# ========== LOGGER SETUP ==========
 
-EMAIL_REGEX = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+', re.UNICODE)
-PHONE_REGEX = re.compile(r'(\+?\d{1,3}[-.\s]?(\(?\d+\)?[-.\s]?)+\d+)', re.UNICODE)
-IP_REGEX = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode='a',
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    level=logging.DEBUG
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
 
-def iso_timestamp(dt=None):
-    if dt is None:
-        dt = datetime.now(timezone.utc)
-    return dt.isoformat(timespec='seconds')
+# ========== HELPER FUNCTIONS ==========
 
-def print_progress(message):
-    print(f"[{iso_timestamp()}] {message}")
+def iso_utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
-def is_valid_url(url):
+def obfuscate_string(s):
+    # Very basic obfuscation by interleaving chars with random letters
+    import string
+    obfuscated = ''.join(c + random.choice(string.ascii_letters) for c in s)
+    return obfuscated
+
+def deobfuscate_string(s):
+    # Reverse of above: take every second char
+    return s[::2]
+
+def normalize_url(base, link):
+    # Normalize relative or absolute URLs
+    if not link:
+        return None
+    if link.startswith('mailto:'):
+        return None
+    if link.startswith('#'):
+        return None
     try:
-        p = urlparse(url)
-        return p.scheme in ['http', 'https'] and p.netloc != ''
-    except:
+        return urljoin(base, link)
+    except Exception:
+        return None
+
+def is_same_domain(url1, url2):
+    try:
+        d1 = urlparse(url1).netloc.lower()
+        d2 = urlparse(url2).netloc.lower()
+        return d1 == d2
+    except Exception:
         return False
 
-def normalize_url(base_url, link):
-    return urljoin(base_url, link)
-
-def get_links(html, base_url):
-    soup = BeautifulSoup(html, 'html.parser')
-    links = set()
-    for a in soup.find_all('a', href=True):
-        link = normalize_url(base_url, a['href'])
-        if is_valid_url(link):
-            links.add(link)
-    return links
-
-def extract_entities(text):
-    emails = set(EMAIL_REGEX.findall(text))
-    phones = set(phone[0] if isinstance(phone, tuple) else phone for phone in PHONE_REGEX.findall(text))
-    ips = set(IP_REGEX.findall(text))
-    return emails, phones, ips
-
-def check_port(ip, port):
+async def send_to_discord(webhook_url, content):
     try:
-        with socket.create_connection((ip, port), timeout=2):
-            return True
-    except:
-        return False
-
-def send_to_discord(content):
-    headers = {'Content-Type': 'application/json'}
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=content, headers=headers, timeout=10)
-        if r.status_code == 204:
-            print_progress("[INFO] Sent results to Discord webhook successfully.")
-        else:
-            print_progress(f"[WARN] Discord webhook returned status {r.status_code}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(webhook_url, json={"content": content}) as resp:
+                if resp.status != 204:
+                    logging.warning(f"Discord webhook failed with status {resp.status}")
     except Exception as e:
-        print_progress(f"[ERROR] Failed sending to Discord webhook: {e}")
+        logging.error(f"Exception sending to Discord: {e}")
 
-async def fetch_page_playwright(url, user_agent):
+def save_checkpoint(data):
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent=user_agent)
-            page = await context.new_page()
-            await page.goto(url, timeout=30000)
-            content = await page.content()
+        with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        logging.info(f"Checkpoint saved to {CHECKPOINT_FILE}")
+    except Exception as e:
+        logging.error(f"Failed to save checkpoint: {e}")
+
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            logging.info(f"Checkpoint loaded from {CHECKPOINT_FILE}")
+            return data
+        except Exception as e:
+            logging.error(f"Failed to load checkpoint: {e}")
+    return None
+
+def save_emails_to_file(emails):
+    try:
+        with open(OUTPUT_EMAILS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(sorted(list(emails)), f, indent=2)
+        logging.info(f"Emails saved to {OUTPUT_EMAILS_FILE}")
+    except Exception as e:
+        logging.error(f"Failed to save emails: {e}")
+
+# ========== SCRAPER CLASS ==========
+
+class AdvancedScraper:
+
+    def __init__(self, start_url, max_depth, max_pages, concurrency, proxies):
+        self.start_url = start_url
+        self.max_depth = max_depth
+        self.max_pages = max_pages
+        self.concurrency = concurrency
+        self.proxies = proxies or []
+        self.emails = set()
+        self.visited = set()
+        self.to_visit = []
+        self.total_pages = 0
+        self.start_time = None
+        self.end_time = None
+        self.base_domain = urlparse(start_url).netloc.lower()
+        self._lock = asyncio.Lock()
+        self._checkpoint_counter = 0
+        self._stop_requested = False
+
+    async def _setup_browser(self):
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        return playwright, browser
+
+    async def _close_browser(self, playwright, browser):
+        try:
             await browser.close()
-            return content
-    except Exception as e:
-        print_progress(f"[WARN] Playwright failed fetching {url}: {e}")
-        return None
-
-async def scrape_url_async(url):
-    user_agent = USER_AGENTS[int(time.time()*1000) % len(USER_AGENTS)]
-    print_progress(f"[INFO] Scraping URL with Playwright: {url} using UA: {user_agent[:40]}...")
-    html = await fetch_page_playwright(url, user_agent)
-    if not html:
-        return None
-    emails, phones, ips = extract_entities(html)
-    links = get_links(html, url)
-    return {
-        'url': url,
-        'emails': list(emails),
-        'phones': list(phones),
-        'ips': list(ips),
-        'links_found': list(links),
-    }
-
-async def scrape_all_async(urls, max_workers=5):
-    results = []
-    sem = asyncio.Semaphore(max_workers)
-    async def bound_scrape(url):
-        async with sem:
-            return await scrape_url_async(url)
-    tasks = [asyncio.create_task(bound_scrape(url)) for url in urls]
-    for task in asyncio.as_completed(tasks):
-        res = await task
-        if res:
-            results.append(res)
-    return results
-
-def search_duckduckgo(query, max_results=10):
-    print_progress("[INFO] Searching DuckDuckGo for URLs...")
-    urls = set()
-    url_template = "https://html.duckduckgo.com/html/?q={query}&s={offset}"
-    session = requests.Session()
-    offset = 0
-    while len(urls) < max_results:
+        except Exception:
+            pass
         try:
-            r = session.get(url_template.format(query=query, offset=offset), timeout=15)
-            r.raise_for_status()
+            await playwright.stop()
+        except Exception:
+            pass
+
+    async def _random_delay(self):
+        delay = random.uniform(*REQUEST_DELAY)
+        logging.debug(f"Delaying for {delay:.2f} seconds")
+        await asyncio.sleep(delay)
+
+    async def _fetch_page(self, browser, url, proxy=None):
+        user_agent = random.choice(USER_AGENTS)
+        context_args = {
+            "user_agent": user_agent,
+            "viewport": {
+                "width": random.randint(1200, 1920),
+                "height": random.randint(700, 1080)
+            },
+            "java_script_enabled": True,
+            "locale": "en-US",
+        }
+        if proxy:
+            context_args["proxy"] = {"server": proxy}
+
+        context = await browser.new_context(**context_args)
+        page = await context.new_page()
+
+        # Anti-headless detection workaround:
+        # - Override navigator.webdriver
+        await page.add_init_script(
+            """() => {
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.navigator.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            }"""
+        )
+
+        try:
+            logging.info(f"[INFO] Loading page: {url} with UA: {user_agent}")
+            await page.goto(url, wait_until='networkidle', timeout=30000)
+            await asyncio.sleep(random.uniform(1.5, 3.5))  # post-load wait
+
+            # Detect and handle possible JS captcha or challenge - just wait longer if suspected
+            content = await page.content()
+            if "captcha" in content.lower() or "challenge" in content.lower():
+                logging.warning(f"[WARN] Captcha or challenge detected on {url}. Waiting extra 10s...")
+                await asyncio.sleep(10)
+
+            # Extract emails strictly from mailto links and those in title attrs
+            mailto_hrefs = await page.eval_on_selector_all(
+                "a[href^='mailto:']",
+                "elements => elements.map(el => ({ href: el.getAttribute('href'), title: el.getAttribute('title'), text: el.textContent }))"
+            )
+
+            emails_found = set()
+            for link in mailto_hrefs:
+                href = link.get('href') or ''
+                title = link.get('title') or ''
+                text = link.get('text') or ''
+
+                # Extract email from mailto:
+                m = re.match(r'mailto:([^?]+)', href)
+                if m:
+                    email = m.group(1).strip()
+                    if EMAIL_REGEX.fullmatch(email):
+                        emails_found.add(email.lower())
+                # Sometimes email might be in title attribute or text
+                for s in (title, text):
+                    if s and EMAIL_REGEX.search(s):
+                        for em in EMAIL_REGEX.findall(s):
+                            emails_found.add(em.lower())
+
+            # Additionally extract any emails visible in page text (backup)
+            all_text = await page.evaluate("() => document.body.innerText")
+            if all_text:
+                for em in EMAIL_REGEX.findall(all_text):
+                    emails_found.add(em.lower())
+
+            # Extract all same domain href links for crawling deeper
+            anchors = await page.eval_on_selector_all("a[href]", "elements => elements.map(e => e.href)")
+            new_links = []
+            for href in anchors:
+                href_norm = normalize_url(url, href)
+                if href_norm and is_same_domain(self.start_url, href_norm):
+                    new_links.append(href_norm)
+
+            await context.close()
+            return emails_found, new_links
+
+        except PlaywrightTimeoutError:
+            logging.error(f"[ERROR] Timeout loading page: {url}")
+        except PlaywrightError as pe:
+            logging.error(f"[ERROR] Playwright error on page {url}: {pe}")
         except Exception as e:
-            print_progress(f"[WARN] DuckDuckGo search failed: {e}")
-            break
-        soup = BeautifulSoup(r.text, 'html.parser')
-        results = soup.select('a.result__a')
-        if not results:
-            break
-        for rlink in results:
-            href = rlink.get('href')
-            if href and is_valid_url(href):
-                urls.add(href)
-                if len(urls) >= max_results:
-                    break
-        offset += len(results)
-    return list(urls)
+            logging.error(f"[ERROR] Exception on page {url}: {e}")
 
-def search_bing(query, max_results=10):
-    print_progress("[INFO] Searching Bing for URLs...")
-    urls = set()
-    url_template = "https://www.bing.com/search?q={query}&first={offset}"
-    session = requests.Session()
-    offset = 1
-    while len(urls) < max_results:
+        await context.close()
+        return set(), []
+
+    async def _worker(self, browser):
+        while True:
+            if self._stop_requested:
+                logging.info("[INFO] Stop requested, exiting worker")
+                break
+            async with self._lock:
+                if not self.to_visit or self.total_pages >= self.max_pages:
+                    break
+                url, depth = self.to_visit.pop(0)
+                if url in self.visited or depth > self.max_depth:
+                    continue
+                self.visited.add(url)
+                self.total_pages += 1
+
+            logging.info(f"[SCRAPE] Visiting {url} at depth {depth} (Page {self.total_pages}/{self.max_pages})")
+
+            proxy = random.choice(self.proxies) if self.proxies else None
+            emails_found, new_links = await self._fetch_page(browser, url, proxy)
+
+            async with self._lock:
+                self.emails.update(emails_found)
+                # Queue new links
+                for nl in new_links:
+                    if nl not in self.visited and nl not in [u for u, _ in self.to_visit]:
+                        self.to_visit.append((nl, depth + 1))
+
+                self._checkpoint_counter += 1
+                if self._checkpoint_counter >= SAVE_CHECKPOINT_EVERY:
+                    self._checkpoint_counter = 0
+                    self._save_checkpoint()
+
+            await self._random_delay()
+
+    def _save_checkpoint(self):
+        data = {
+            'visited': list(self.visited),
+            'to_visit': self.to_visit,
+            'emails': list(self.emails),
+            'total_pages': self.total_pages,
+            'start_time': self.start_time,
+        }
+        save_checkpoint(data)
+
+    def _load_checkpoint(self):
+        data = load_checkpoint()
+        if data:
+            self.visited = set(data.get('visited', []))
+            self.to_visit = data.get('to_visit', [])
+            self.emails = set(data.get('emails', []))
+            self.total_pages = data.get('total_pages', 0)
+            self.start_time = data.get('start_time', None)
+            logging.info(f"[INFO] Resuming from checkpoint. Visited: {len(self.visited)}, Queue: {len(self.to_visit)}, Emails: {len(self.emails)}, Pages: {self.total_pages}")
+            return True
+        return False
+
+    async def run(self):
+        self.start_time = iso_utc_now()
+
+        # Load checkpoint if available, else start fresh
+        if not self._load_checkpoint():
+            self.to_visit = [(self.start_url, 0)]
+
+        playwright, browser = await self._setup_browser()
+
         try:
-            r = session.get(url_template.format(query=query, offset=offset), timeout=15)
-            r.raise_for_status()
+            workers = [asyncio.create_task(self._worker(browser)) for _ in range(self.concurrency)]
+            await asyncio.gather(*workers)
         except Exception as e:
-            print_progress(f"[WARN] Bing search failed: {e}")
-            break
-        soup = BeautifulSoup(r.text, 'html.parser')
-        results = soup.select('li.b_algo h2 a')
-        if not results:
-            break
-        for rlink in results:
-            href = rlink.get('href')
-            if href and is_valid_url(href):
-                urls.add(href)
-                if len(urls) >= max_results:
-                    break
-        offset += 10
-    return list(urls)
+            logging.error(f"[ERROR] Unexpected error during scraping: {e}")
+        finally:
+            await self._close_browser(playwright, browser)
 
-def scrape_ip(ip):
-    found_data = {'ip': ip, 'open_ports': [], 'data': []}
-    print_progress(f"[INFO] Scanning IP {ip} on common HTTP ports...")
-    for port in COMMON_PORTS:
-        if check_port(ip, port):
-            found_data['open_ports'].append(port)
-    return found_data
+        self.end_time = iso_utc_now()
+        duration = (datetime.fromisoformat(self.end_time) - datetime.fromisoformat(self.start_time)).total_seconds()
+        logging.info(f"[INFO] Scraping finished. Duration: {duration:.2f} seconds. Pages scraped: {self.total_pages}. Emails found: {len(self.emails)}")
 
-def main():
-    parser = argparse.ArgumentParser(description="EXTREME ROBUST PLAYWRIGHT SCRAPER + SEARCH + DISCORD WEBHOOK")
-    parser.add_argument("target", help="URL or IP to scrape")
-    parser.add_argument("-k", "--keyword", help="Keyword for search engines (to find URLs)", default=None)
-    parser.add_argument("-d", "--depth", type=int, default=1, help="Depth of crawling (default 1)")
-    parser.add_argument("-m", "--maxsearch", type=int, default=5, help="Max search engine results to scrape per engine")
-    args = parser.parse_args()
+        # Save final checkpoint & emails
+        self._save_checkpoint()
+        save_emails_to_file(self.emails)
 
-    start_time = datetime.now(timezone.utc)
-    print_progress(f"=== Scraper started at {iso_timestamp(start_time)} UTC ===")
+        # Send summary and emails to Discord in chunks
+        await self._send_results_to_discord(duration)
 
-    targets_to_scrape = []
+    async def _send_results_to_discord(self, duration):
+        summary = (
+            f"**Scraping Summary**\n"
+            f"Start URL: {self.start_url}\n"
+            f"Pages Scraped: {self.total_pages}\n"
+            f"Emails Found: {len(self.emails)}\n"
+            f"Start Time (UTC): {self.start_time}\n"
+            f"End Time (UTC): {self.end_time}\n"
+            f"Duration (seconds): {duration:.2f}\n"
+        )
+        await send_to_discord(DISCORD_WEBHOOK_URL, summary)
 
-    if args.keyword:
-        ddg_results = search_duckduckgo(args.keyword, max_results=args.maxsearch)
-        bing_results = search_bing(args.keyword, max_results=args.maxsearch)
-        combined = set(ddg_results + bing_results)
-        print_progress(f"[INFO] Found {len(combined)} URLs from search engines")
-        targets_to_scrape.extend(combined)
+        if not self.emails:
+            await send_to_discord(DISCORD_WEBHOOK_URL, "No emails found.")
+            return
 
-    if is_valid_url(args.target):
-        targets_to_scrape.append(args.target)
-    else:
-        try:
-            socket.inet_aton(args.target)
-            targets_to_scrape.append(f"http://{args.target}")
-        except:
-            print_progress("[ERROR] Target is neither valid URL nor IP.")
-            sys.exit(1)
+        # Send emails in chunks to avoid Discord message limits
+        emails_sorted = sorted(self.emails)
+        chunk_size = 1900
+        chunk = ""
+        for email in emails_sorted:
+            if len(chunk) + len(email) + 2 > chunk_size:
+                await send_to_discord(DISCORD_WEBHOOK_URL, f"```\n{chunk}```")
+                chunk = ""
+            chunk += email + "\n"
+        if chunk:
+            await send_to_discord(DISCORD_WEBHOOK_URL, f"```\n{chunk}```")
 
-    scraped_urls = set()
-    next_depth = set(targets_to_scrape)
+    def request_stop(self):
+        self._stop_requested = True
 
-    # Async event loop for Playwright scraping
-    loop = asyncio.get_event_loop()
+# ========== MAIN RUN ==========
 
-    for depth in range(args.depth):
-        print_progress(f"[INFO] Crawl depth {depth+1} with {len(next_depth)} URLs")
-        to_scrape = list(next_depth - scraped_urls)
-        if not to_scrape:
-            break
-        results = loop.run_until_complete(scrape_all_async(to_scrape, max_workers=5))
-        for res in results:
-            if res:
-                scraped_urls.add(res['url'])
-                # Add next depth links
-                if depth + 1 < args.depth:
-                    next_depth.update(res.get('links_found', []))
-        if depth + 1 < args.depth:
-            # Prepare for next depth
-            next_depth = next_depth.union(*[set(r.get('links_found', [])) for r in results if r]) - scraped_urls
-
-    # Scan IP if applicable
-    ip = None
-    try:
-        ip = socket.gethostbyname(urlparse(args.target).netloc)
-    except:
-        ip = None
-
-    ip_scan = None
-    if ip:
-        ip_scan = scrape_ip(ip)
-
-    end_time = datetime.now(timezone.utc)
-    duration = end_time - start_time
-
-    # Collect all emails, phones, ips found
-    all_emails = set()
-    all_phones = set()
-    all_ips = set()
-    for url in scraped_urls:
-        # Not saving full page data here to save memory,
-        # but you can extend to store full data per URL if you want
-        pass
-
-    # Summarize by scraping targets (you could accumulate per URL in full solution)
-    summary = {
-        'total_urls_scraped': len(scraped_urls),
-        'total_emails_found': 0,  # To add, you can accumulate from results above
-        'total_phones_found': 0,
-        'total_ips_found': 0,
-        'start_time_utc': iso_timestamp(start_time),
-        'end_time_utc': iso_timestamp(end_time),
-        'duration_seconds': int(duration.total_seconds()),
-    }
-    # For demo, 0 found as actual extraction can be added accumulating from results
-
-    # Discord embed message
-    discord_content = {
-        "username": "ExtremeScraperBot",
-        "embeds": [{
-            "title": "Scraping Report",
-            "description": f"Target: {args.target}\n"
-                           f"Keyword: {args.keyword or 'N/A'}\n"
-                           f"Depth: {args.depth}\n"
-                           f"Duration: {str(duration)}\n"
-                           f"Total URLs Scraped: {summary['total_urls_scraped']}\n"
-                           f"Emails found: {summary['total_emails_found']}\n"
-                           f"Phones found: {summary['total_phones_found']}\n"
-                           f"IPs found: {summary['total_ips_found']}",
-            "timestamp": iso_timestamp(end_time),
-            "color": 0x00ff00
-        }]
-    }
-
-    send_to_discord(discord_content)
-
-    print("\n=== Scraping summary ===")
-    print(json.dumps(summary, indent=2))
-    print(f"Discord webhook sent at {iso_timestamp(end_time)}")
+async def main():
+    scraper = AdvancedScraper(
+        start_url=START_URL,
+        max_depth=MAX_DEPTH,
+        max_pages=MAX_PAGES,
+        concurrency=CONCURRENT_PAGES,
+        proxies=PROXIES
+    )
+    await scraper.run()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt caught, exiting gracefully.")
